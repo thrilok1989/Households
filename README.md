@@ -4,6 +4,59 @@ Estimates **modeled** NIFTY dealer exposure and hedging pressure from
 live Dhan option-chain data, and checks whether actual market behaviour
 is confirming that read.
 
+# NIFTY Dealer Intelligence V2.1.2 — futures resolution diagnostics
+
+## Live test result and the fix
+
+A live run against a real, market-closed Dhan session confirmed the
+whole V2.1.1 pipeline is genuinely wired: spot ticking live, dealer
+regime computed from real option-chain Greeks/OI (`EXPANSION`, GEX
+−195,834,850L, Gamma Flip ₹23,488, spot 90pts below it), confirmation
+engine honestly reporting `NO CONFIRMATION`/`UNAVAILABLE` for every
+input that genuinely wasn't wired (no fabrication anywhere) — but
+**futures resolution itself failed**: `Futures: UNAVAILABLE — Could not
+resolve the current NIFTY futures contract from the instrument master.`
+
+That's the correct failure behavior (never guess an ID), but it gave no
+way to tell *why* it failed. V2.1.2 adds `futures_data.
+InstrumentMasterDiagnostics`: every parsing step now records what it
+actually saw — the real column headers in the fetched CSV, which
+candidate names matched, how many rows contained "NIFTY", how many of
+those passed the instrument/exchange filter, how many had a valid
+unexpired expiry — and a plain-language diagnosis of exactly which step
+came up empty. This is surfaced in two places:
+
+- **Data Health issues** now include a one-line summary pointing to the
+  diagnostic panel when futures is unavailable.
+- **The Live Diagnostic Panel** gets a new "Futures Resolution
+  Diagnostics" section with the full detail — including the first 15
+  column headers Dhan's instrument master actually returned, which is
+  exactly what's needed to fix the column-name guesses in
+  `futures_data.py`'s `_EXCHANGE_COLS`/`_SYMBOL_COLS`/etc. lists if
+  Dhan's real schema differs from the candidates currently tried.
+
+A short (30s) failure-cache TTL was also added so a column-name fix
+takes effect on the next refresh instead of being stuck behind the
+6-hour success-cache TTL, without hammering Dhan's server with a fresh
+multi-row CSV fetch on every Streamlit rerun while broken.
+
+**Tests: 132 → 138, all passing.** Six new tests exercise the
+diagnostics against synthetic CSVs: missing columns, zero NIFTY rows,
+NIFTY rows found but all expired, and the success case — plus an
+end-to-end test that `fetch_futures_snapshot` actually surfaces
+`.diagnostics` on a real resolution failure, not just a generic message.
+
+**Practical next step for the person running this against a live Dhan
+account:** open the Live Diagnostic Panel → "Futures Resolution
+Diagnostics" → "Column headers seen (first 15)" after the next refresh.
+That list is the actual live schema Dhan is returning; if it doesn't
+contain any of `SEM_TRADING_SYMBOL`/`SEM_SMST_SECURITY_ID`/etc., that's
+the fix needed in `futures_data.py`'s candidate-column lists — and the
+diagnostics will say exactly which of the two (symbol vs. security-ID
+column) is the blocker.
+
+---
+
 # NIFTY Dealer Intelligence V2.1.1 (+ Cash Market integration)
 
 ## Cash Market — now a first-class, explicit layer

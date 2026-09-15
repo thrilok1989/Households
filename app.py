@@ -174,6 +174,9 @@ def main() -> None:
         fii_dii_available=False, futures_snapshot=futures_snapshot, cvd_status=cvd_status,
         levels_available=levels_placeholder.support is not None, vwap_available=levels_placeholder.vwap is not None,
     )
+    if not futures_snapshot.available and futures_snapshot.error:
+        health.issues.append(f"Futures unavailable: {futures_snapshot.error} "
+                              f"(see 'Futures Resolution Diagnostics' in the Live Diagnostic Panel below).")
     render_data_health(health)
     if tte_floored:
         st.caption(
@@ -324,7 +327,23 @@ def main() -> None:
             "LTP": futures_snapshot.ltp, "Price change": futures_snapshot.price_change,
             "OI": futures_snapshot.oi, "ΔOI": futures_snapshot.oi_change,
             "Positioning": futures_positioning,
+            "Error": futures_snapshot.error,
         },
+        **({"Futures Resolution Diagnostics": {
+            "Fetch OK": futures_snapshot.diagnostics.fetch_ok,
+            "Fetch error": futures_snapshot.diagnostics.fetch_error,
+            "Rows scanned": futures_snapshot.diagnostics.row_count,
+            "Column headers seen (first 15)": futures_snapshot.diagnostics.fieldnames_sample,
+            "Matched exchange col": futures_snapshot.diagnostics.matched_exchange_col,
+            "Matched instrument col": futures_snapshot.diagnostics.matched_instrument_col,
+            "Matched symbol col": futures_snapshot.diagnostics.matched_symbol_col,
+            "Matched security-ID col": futures_snapshot.diagnostics.matched_security_id_col,
+            "Matched expiry col": futures_snapshot.diagnostics.matched_expiry_col,
+            "Rows with 'NIFTY' in symbol": futures_snapshot.diagnostics.nifty_symbol_rows,
+            "...passing instrument/exchange filter": futures_snapshot.diagnostics.futidx_candidate_rows,
+            "...with a valid unexpired expiry": futures_snapshot.diagnostics.unexpired_candidates,
+            "Diagnosis": futures_snapshot.diagnostics.note,
+        }} if futures_snapshot.diagnostics else {}),
         "Flow / CVD": {
             "Status": cvd_status.value, "Buy qty": futures_snapshot.buy_quantity,
             "Sell qty": futures_snapshot.sell_quantity, "Flow proxy": futures_snapshot.flow_proxy,

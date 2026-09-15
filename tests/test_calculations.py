@@ -1192,7 +1192,7 @@ def test_parse_instrument_master_uses_ist_aware_today_no_tz_crash():
         "BANKNIFTY-FUT,99999,FUTIDX,NSE,2030-01-30\n"
     )
     from futures_data import _parse_instrument_master
-    resolved = _parse_instrument_master(csv_text)  # must not raise
+    resolved, diag = _parse_instrument_master(csv_text)  # must not raise
     assert resolved is not None
     assert resolved.security_id == 12345
     assert "BANKNIFTY" not in resolved.symbol
@@ -1281,3 +1281,91 @@ def test_cash_volume_and_cvd_distinct_from_futures_flow_in_data_health_keys():
     assert {"Cash Volume", "Cash Flow/CVD"}.issubset(health.field_status.keys())
     assert health.field_status["Cash Volume"] == FieldStatus.UNAVAILABLE
     assert health.field_status["Cash Flow/CVD"] == FieldStatus.UNAVAILABLE
+
+
+# =======================================================================
+# Futures resolution diagnostics (debuggability when resolution fails)
+# =======================================================================
+
+from futures_data import InstrumentMasterDiagnostics
+
+
+def test_diagnostics_report_missing_columns_honestly():
+    csv_text = "SOME_UNRELATED_COL,ANOTHER_COL\nfoo,bar\n"
+    from futures_data import _parse_instrument_master
+    resolved, diag = _parse_instrument_master(csv_text)
+    assert resolved is None
+    assert diag.matched_symbol_col is None
+    assert diag.matched_security_id_col is None
+    assert "Could not match" in diag.note
+    assert diag.fieldnames_sample == ["SOME_UNRELATED_COL", "ANOTHER_COL"]
+
+
+def test_diagnostics_report_no_nifty_rows_found():
+    csv_text = (
+        "SEM_TRADING_SYMBOL,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,SEM_EXM_EXCH_ID,SEM_EXPIRY_DATE\n"
+        "RELIANCE-FUT,555,FUTSTK,NSE,2030-01-30\n"
+    )
+    from futures_data import _parse_instrument_master
+    resolved, diag = _parse_instrument_master(csv_text)
+    assert resolved is None
+    assert diag.nifty_symbol_rows == 0
+    assert "no row contained 'NIFTY'" in diag.note
+
+
+def test_diagnostics_report_expired_only_contracts():
+    csv_text = (
+        "SEM_TRADING_SYMBOL,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,SEM_EXM_EXCH_ID,SEM_EXPIRY_DATE\n"
+        "NIFTY-FUT,12345,FUTIDX,NSE,2020-01-30\n"  # expired long ago
+    )
+    from futures_data import _parse_instrument_master
+    resolved, diag = _parse_instrument_master(csv_text)
+    assert resolved is None
+    assert diag.nifty_symbol_rows == 1
+    assert diag.futidx_candidate_rows == 1
+    assert diag.unexpired_candidates == 0
+    assert "non-expired expiry" in diag.note
+
+
+def test_diagnostics_success_case_has_positive_note():
+    csv_text = (
+        "SEM_TRADING_SYMBOL,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,SEM_EXM_EXCH_ID,SEM_EXPIRY_DATE\n"
+        "NIFTY-FUT,12345,FUTIDX,NSE,2030-01-30\n"
+    )
+    from futures_data import _parse_instrument_master
+    resolved, diag = _parse_instrument_master(csv_text)
+    assert resolved is not None
+    assert "Resolved successfully" in diag.note
+    assert diag.unexpired_candidates == 1
+
+
+def test_diagnostics_empty_csv_reports_no_header():
+    from futures_data import _parse_instrument_master
+    resolved, diag = _parse_instrument_master("")
+    assert resolved is None
+    assert "no header row" in diag.note
+
+
+def test_futures_snapshot_carries_diagnostics_on_resolution_failure():
+    """End-to-end: fetch_futures_snapshot must surface WHY resolution
+    failed via .diagnostics, not just a generic 'unavailable' message."""
+    import futures_data as fd
+
+    class _FakeClient:
+        def get_instrument_master_csv_text(self, url, timeout_seconds=20.0):
+            return "SOME_COL,OTHER_COL\nx,y\n"  # no matching columns at all
+
+    from cache import cache as _cache
+    _cache.clear()
+
+    class _FakeStore:
+        def get_previous_futures_snapshot(self, ts):
+            return None
+        def save_futures_snapshot(self, *a, **k):
+            pass
+
+    snap = fd.fetch_futures_snapshot(_FakeClient(), _FakeStore())
+    assert snap.available is False
+    assert snap.diagnostics is not None
+    assert "Could not match" in snap.diagnostics.note
+    assert "Could not resolve" in snap.error

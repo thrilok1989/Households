@@ -48,12 +48,44 @@ _SYMBOL_COLS = ["SEM_TRADING_SYMBOL", "SEM_CUSTOM_SYMBOL", "SYMBOL_NAME"]
 _SECURITY_ID_COLS = ["SEM_SMST_SECURITY_ID", "SECURITY_ID"]
 _EXPIRY_COLS = ["SEM_EXPIRY_DATE", "EXPIRY_DATE"]
 
+# How long a FAILED resolution attempt is cached before retrying — kept
+# short (unlike the long success TTL) so a column-name fix or a
+# transient network blip doesn't stay stuck until the next refresh.
+_FAILURE_CACHE_TTL_SECONDS = 30
+
 
 @dataclass
 class ResolvedFuture:
     security_id: int
     symbol: str
     expiry: Optional[str]
+
+
+@dataclass
+class InstrumentMasterDiagnostics:
+    """
+    Explains exactly WHY futures resolution failed (or succeeded), so a
+    failure is debuggable from the running app's diagnostic panel rather
+    than just showing "unavailable". Nothing here is guessed — every
+    field reflects something actually observed while parsing.
+    """
+    fetch_ok: bool
+    fetch_error: Optional[str] = None
+    row_count: int = 0
+    fieldnames_sample: list[str] = None  # first ~15 column names actually seen in the CSV
+    matched_exchange_col: Optional[str] = None
+    matched_instrument_col: Optional[str] = None
+    matched_symbol_col: Optional[str] = None
+    matched_security_id_col: Optional[str] = None
+    matched_expiry_col: Optional[str] = None
+    nifty_symbol_rows: int = 0       # rows where symbol contained "NIFTY" (before other filters)
+    futidx_candidate_rows: int = 0   # of those, rows that also passed instrument/exchange filters
+    unexpired_candidates: int = 0    # of those, rows with a parseable, non-expired expiry
+    note: str = ""
+
+    def __post_init__(self):
+        if self.fieldnames_sample is None:
+            self.fieldnames_sample = []
 
 
 @dataclass
@@ -79,6 +111,9 @@ class FuturesSnapshot:
     flow_proxy: Optional[float] = None          # buy_quantity - sell_quantity, this snapshot
     flow_proxy_change: Optional[float] = None   # vs previous snapshot's flow_proxy
     flow_proxy_available: bool = False
+    # V2.1.2 — WHY resolution failed, when it did. None when a manual
+    # override or a cached resolution was used (nothing to diagnose).
+    diagnostics: Optional["InstrumentMasterDiagnostics"] = None
 
 
 def _first_matching_column(fieldnames: list[str], candidates: list[str]) -> Optional[str]:
@@ -89,42 +124,61 @@ def _first_matching_column(fieldnames: list[str], candidates: list[str]) -> Opti
     return None
 
 
-def _parse_instrument_master(csv_text: str) -> Optional[ResolvedFuture]:
+def _parse_instrument_master(csv_text: str) -> tuple[Optional[ResolvedFuture], InstrumentMasterDiagnostics]:
     """
     Parses the instrument master looking for NIFTY index futures
     (NSE, FUTIDX-style instrument, symbol containing "NIFTY" but not
     "BANKNIFTY"/"FINNIFTY"/other NIFTY-family indices), picks the
-    nearest unexpired contract. Returns None if the schema doesn't match
-    any known column-name variant, or no matching row is found — this
-    function never guesses.
+    nearest unexpired contract. Returns (None, diagnostics) if the
+    schema doesn't match any known column-name variant, or no matching
+    row is found — this function never guesses, and the diagnostics
+    explain exactly which step failed.
     """
     reader = csv.DictReader(io.StringIO(csv_text))
     fieldnames = reader.fieldnames or []
+    diag = InstrumentMasterDiagnostics(fetch_ok=True, fieldnames_sample=fieldnames[:15])
+
     if not fieldnames:
-        return None
+        diag.note = "CSV had no header row at all (empty or non-CSV response)."
+        return None, diag
 
     exch_col = _first_matching_column(fieldnames, _EXCHANGE_COLS)
     instr_col = _first_matching_column(fieldnames, _INSTRUMENT_COLS)
     symbol_col = _first_matching_column(fieldnames, _SYMBOL_COLS)
     secid_col = _first_matching_column(fieldnames, _SECURITY_ID_COLS)
     expiry_col = _first_matching_column(fieldnames, _EXPIRY_COLS)
+    diag.matched_exchange_col = exch_col
+    diag.matched_instrument_col = instr_col
+    diag.matched_symbol_col = symbol_col
+    diag.matched_security_id_col = secid_col
+    diag.matched_expiry_col = expiry_col
 
     if not (symbol_col and secid_col):
-        return None  # can't identify the columns we need — fail honestly
+        diag.note = (
+            f"Could not match a symbol column (tried {_SYMBOL_COLS}) and/or a security-ID column "
+            f"(tried {_SECURITY_ID_COLS}) against the actual headers above. Update these candidate "
+            f"lists at the top of futures_data.py to match the real column name."
+        )
+        return None, diag  # can't identify the columns we need — fail honestly
 
     candidates: list[tuple[datetime, ResolvedFuture]] = []
     today_date = now_ist().date()
+    row_count = 0
 
     for row in reader:
+        row_count += 1
         symbol = (row.get(symbol_col) or "").upper()
         if "NIFTY" not in symbol:
             continue
         if any(x in symbol for x in ("BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT")):
             continue
+        diag.nifty_symbol_rows += 1
+
         if instr_col and "FUT" not in (row.get(instr_col) or "").upper():
             continue
         if exch_col and (row.get(exch_col) or "").upper() not in ("NSE", ""):
             continue
+        diag.futidx_candidate_rows += 1
 
         raw_secid = row.get(secid_col)
         if not raw_secid:
@@ -145,42 +199,86 @@ def _parse_instrument_master(csv_text: str) -> Optional[ResolvedFuture]:
                     continue
         if expiry_dt is None or expiry_dt.date() < today_date:
             continue
+        diag.unexpired_candidates += 1
 
         candidates.append((expiry_dt, ResolvedFuture(security_id=security_id, symbol=symbol, expiry=expiry_str)))
 
+    diag.row_count = row_count
+
     if not candidates:
-        return None
+        if diag.nifty_symbol_rows == 0:
+            diag.note = (
+                f"Symbol column '{symbol_col}' matched, but no row contained 'NIFTY' — either the "
+                f"wrong column was matched, or the file doesn't use 'NIFTY' in this field. "
+                f"First 3 raw values seen in that column would help diagnose this."
+            )
+        elif diag.futidx_candidate_rows == 0:
+            diag.note = (
+                f"{diag.nifty_symbol_rows} row(s) contained 'NIFTY', but none passed the "
+                f"instrument-type ('FUT' in '{instr_col}') or exchange ('{exch_col}' == NSE) filter. "
+                f"Check whether instr_col/exch_col matched the right columns, or loosen the filter."
+            )
+        else:
+            diag.note = (
+                f"{diag.futidx_candidate_rows} candidate row(s) matched symbol+instrument+exchange, "
+                f"but none had a parseable, non-expired expiry in column '{expiry_col}'. Check the "
+                f"expiry date format actually used in the file against the formats this parser tries."
+            )
+        return None, diag
 
     candidates.sort(key=lambda c: c[0])
-    return candidates[0][1]
+    diag.note = f"Resolved successfully: {len(candidates)} unexpired NIFTY future(s) found, nearest expiry chosen."
+    return candidates[0][1], diag
 
 
-def resolve_nifty_futures_security_id(client: DhanClient) -> Optional[ResolvedFuture]:
+def resolve_nifty_futures_security_id(
+    client: DhanClient,
+) -> tuple[Optional[ResolvedFuture], Optional[InstrumentMasterDiagnostics]]:
     """
-    Returns the current-month NIFTY futures contract, preferring:
+    Returns (resolved, diagnostics). `diagnostics` is None only when a
+    manual override or an already-cached resolution was used (nothing
+    to diagnose in either case). Preference order:
       1. A manual override (config.load_futures_security_id_override), if set.
       2. A cached resolution (valid for FUTURES_INSTRUMENT_CACHE_TTL_SECONDS).
       3. A fresh download + parse of Dhan's instrument master.
-    Returns None (never a guess) if none of these succeed.
+    Returns (None, diagnostics) — never a guessed ID — if none succeed.
+    Failed resolutions are cached only briefly (see _FAILURE_CACHE_TTL)
+    so a fix (e.g. to the column-name candidates) takes effect on the
+    next refresh rather than being stuck behind the long success TTL.
     """
     override = load_futures_security_id_override()
     if override is not None:
-        return ResolvedFuture(security_id=override, symbol="NIFTY-FUT (manual override)", expiry=None)
+        return ResolvedFuture(security_id=override, symbol="NIFTY-FUT (manual override)", expiry=None), None
 
     cache_key = "nifty_futures_resolution"
     cached = cache.get(cache_key)
     if cached is not None:
-        return cached
+        return cached, None
+
+    # Short-TTL failure cache: avoids re-downloading the (potentially
+    # multi-MB) instrument master on every Streamlit rerun while
+    # resolution is broken, but still retries automatically every
+    # _FAILURE_CACHE_TTL_SECONDS rather than being stuck until the long
+    # success TTL — and still returns the last diagnostics so the UI
+    # keeps showing why it's failing without a fresh fetch each time.
+    failure_key = cache_key + "_failure_diag"
+    cached_failure_diag = cache.get(failure_key)
+    if cached_failure_diag is not None:
+        return None, cached_failure_diag
 
     try:
         csv_text = client.get_instrument_master_csv_text(DHAN_INSTRUMENT_MASTER_URL)
-    except DhanAPIError:
-        return None
+    except DhanAPIError as exc:
+        diag = InstrumentMasterDiagnostics(fetch_ok=False, fetch_error=str(exc))
+        cache.set(failure_key, diag, _FAILURE_CACHE_TTL_SECONDS)
+        return None, diag
 
-    resolved = _parse_instrument_master(csv_text)
+    resolved, diag = _parse_instrument_master(csv_text)
     if resolved is not None:
         cache.set(cache_key, resolved, FUTURES_INSTRUMENT_CACHE_TTL_SECONDS)
-    return resolved
+    else:
+        cache.set(failure_key, diag, _FAILURE_CACHE_TTL_SECONDS)
+    return resolved, diag
 
 
 def classify_futures_positioning(price_change: Optional[float], oi_change: Optional[float]) -> str:
@@ -245,17 +343,25 @@ def fetch_futures_snapshot(client: DhanClient, store) -> FuturesSnapshot:
     """
     store: storage.SnapshotStore — used for the previous-LTP/OI lookup,
     same pattern as option legs. Never raises; any failure produces an
-    `available=False` snapshot with `.error` explaining why, so callers
-    can show "Futures: UNAVAILABLE — <reason>" rather than crashing or
-    silently rendering a zero.
+    `available=False` snapshot with `.error` explaining why AND
+    `.diagnostics` explaining exactly which parsing step failed (see
+    InstrumentMasterDiagnostics), so callers can show "Futures:
+    UNAVAILABLE — <reason>" with real debugging detail rather than
+    crashing, silently rendering a zero, or failing opaquely.
     """
-    resolved = resolve_nifty_futures_security_id(client)
+    resolved, diag = resolve_nifty_futures_security_id(client)
     if resolved is None:
+        if diag and not diag.fetch_ok:
+            error_msg = f"Could not fetch the instrument master: {diag.fetch_error}"
+        elif diag:
+            error_msg = f"Could not resolve the current NIFTY futures contract: {diag.note}"
+        else:
+            error_msg = "Could not resolve the current NIFTY futures contract from the instrument master."
         return FuturesSnapshot(
             symbol=None, expiry=None, ltp=None, previous_ltp=None, price_change=None,
             price_change_pct=None, oi=None, previous_oi=None, oi_change=None, oi_change_pct=None,
             volume=None, timestamp=None, available=False,
-            error="Could not resolve the current NIFTY futures contract from the instrument master.",
+            error=error_msg, diagnostics=diag,
         )
 
     try:
