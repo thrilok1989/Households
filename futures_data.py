@@ -81,11 +81,16 @@ class InstrumentMasterDiagnostics:
     nifty_symbol_rows: int = 0       # rows where symbol contained "NIFTY" (before other filters)
     futidx_candidate_rows: int = 0   # of those, rows that also passed instrument/exchange filters
     unexpired_candidates: int = 0    # of those, rows with a parseable, non-expired expiry
+    parsed_but_expired: int = 0      # of those, rows whose expiry PARSED fine but was in the past
+    sample_expiry_values: list[str] = None  # raw, UNPARSED expiry strings actually seen — the
+                                              # exact evidence needed to add a missing date format
     note: str = ""
 
     def __post_init__(self):
         if self.fieldnames_sample is None:
             self.fieldnames_sample = []
+        if self.sample_expiry_values is None:
+            self.sample_expiry_values = []
 
 
 @dataclass
@@ -114,6 +119,16 @@ class FuturesSnapshot:
     # V2.1.2 — WHY resolution failed, when it did. None when a manual
     # override or a cached resolution was used (nothing to diagnose).
     diagnostics: Optional["InstrumentMasterDiagnostics"] = None
+    # V2.1.2 — OHLC + a few other fields Dhan's quote endpoint commonly
+    # returns alongside LTP/OI. Parsed defensively (multiple candidate
+    # key names, nested-or-flat) — any field Dhan doesn't actually
+    # return for this instrument simply stays None, never fabricated.
+    open_price: Optional[float] = None
+    high_price: Optional[float] = None
+    low_price: Optional[float] = None
+    close_price: Optional[float] = None   # previous session's close
+    average_price: Optional[float] = None
+    last_trade_time: Optional[str] = None
 
 
 def _first_matching_column(fieldnames: list[str], candidates: list[str]) -> Optional[str]:
@@ -121,6 +136,57 @@ def _first_matching_column(fieldnames: list[str], candidates: list[str]) -> Opti
     for c in candidates:
         if c.upper() in upper_map:
             return upper_map[c.upper()]
+    return None
+
+
+# Expiry date formats tried, in order. Broadened after a live Dhan
+# instrument master had SEM_EXPIRY_DATE values this parser's original,
+# narrower list didn't cover — see _parse_expiry_date's fallback below
+# for the "just take the first 10 chars" catch-all that handles most
+# datetime-with-time-component variants without needing to enumerate
+# every one explicitly.
+_EXPIRY_DATE_FORMATS = [
+    "%Y-%m-%d",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%dT%H:%M:%S",
+    "%Y-%m-%d %H:%M:%S.%f",
+    "%d-%b-%Y",
+    "%d-%B-%Y",
+    "%d-%b-%Y %H:%M:%S",
+    "%d/%m/%Y",
+    "%m/%d/%Y",
+    "%Y/%m/%d",
+    "%d-%m-%Y",
+    "%Y%m%d",
+]
+
+
+def _parse_expiry_date(raw: str) -> Optional[datetime]:
+    """
+    Tries every format in _EXPIRY_DATE_FORMATS against the full string,
+    then — since the single most common real-world case is a
+    date-with-time-component in a format not explicitly listed (Dhan's
+    live instrument master has been observed to include a trailing
+    "00:00:00") — falls back to parsing just the first 10 characters as
+    "%Y-%m-%d" if they look like a plain ISO date. Returns None (never
+    guesses a date) if nothing matches.
+    """
+    raw = raw.strip()
+    for fmt in _EXPIRY_DATE_FORMATS:
+        try:
+            return datetime.strptime(raw, fmt)
+        except ValueError:
+            continue
+
+    # Fallback: "2026-09-30 00:00:00", "2026-09-30T00:00:00.0" etc. —
+    # take just the leading YYYY-MM-DD if it matches that shape.
+    head = raw[:10]
+    if len(head) == 10 and head[4] == "-" and head[7] == "-":
+        try:
+            return datetime.strptime(head, "%Y-%m-%d")
+        except ValueError:
+            pass
+
     return None
 
 
@@ -189,15 +255,13 @@ def _parse_instrument_master(csv_text: str) -> tuple[Optional[ResolvedFuture], I
             continue
 
         expiry_str = row.get(expiry_col) if expiry_col else None
-        expiry_dt = None
-        if expiry_str:
-            for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d/%m/%Y"):
-                try:
-                    expiry_dt = datetime.strptime(expiry_str.strip(), fmt)
-                    break
-                except ValueError:
-                    continue
-        if expiry_dt is None or expiry_dt.date() < today_date:
+        expiry_dt = _parse_expiry_date(expiry_str) if expiry_str else None
+        if expiry_dt is None:
+            if expiry_str and len(diag.sample_expiry_values) < 3 and expiry_str not in diag.sample_expiry_values:
+                diag.sample_expiry_values.append(expiry_str)
+            continue
+        if expiry_dt.date() < today_date:
+            diag.parsed_but_expired += 1
             continue
         diag.unexpired_candidates += 1
 
@@ -219,11 +283,25 @@ def _parse_instrument_master(csv_text: str) -> tuple[Optional[ResolvedFuture], I
                 f"Check whether instr_col/exch_col matched the right columns, or loosen the filter."
             )
         else:
-            diag.note = (
-                f"{diag.futidx_candidate_rows} candidate row(s) matched symbol+instrument+exchange, "
-                f"but none had a parseable, non-expired expiry in column '{expiry_col}'. Check the "
-                f"expiry date format actually used in the file against the formats this parser tries."
-            )
+            if diag.sample_expiry_values:
+                diag.note = (
+                    f"{diag.futidx_candidate_rows} candidate row(s) matched symbol+instrument+exchange, "
+                    f"but none had a PARSEABLE expiry in column '{expiry_col}'. Raw values actually "
+                    f"seen: {diag.sample_expiry_values}. Add a matching format to "
+                    f"futures_data._EXPIRY_DATE_FORMATS."
+                )
+            elif diag.parsed_but_expired > 0:
+                diag.note = (
+                    f"{diag.futidx_candidate_rows} candidate row(s) matched and their expiry dates "
+                    f"parsed fine, but all {diag.parsed_but_expired} were in the past — this instrument "
+                    f"master snapshot may be stale, or the exchange/instrument filter matched the "
+                    f"wrong row set."
+                )
+            else:
+                diag.note = (
+                    f"{diag.futidx_candidate_rows} candidate row(s) matched symbol+instrument+exchange, "
+                    f"but the expiry column '{expiry_col}' was empty for all of them."
+                )
         return None, diag
 
     candidates.sort(key=lambda c: c[0])
@@ -381,6 +459,19 @@ def fetch_futures_snapshot(client: DhanClient, store) -> FuturesSnapshot:
         except (TypeError, ValueError):
             return None
 
+    def _nested_f(*path: str) -> Optional[float]:
+        """Walks a nested dict path (e.g. "ohlc", "open") and returns a
+        float, or None if the path doesn't exist / isn't numeric."""
+        node = quote
+        for key in path:
+            if not isinstance(node, dict) or key not in node:
+                return None
+            node = node[key]
+        try:
+            return float(node) if node is not None else None
+        except (TypeError, ValueError):
+            return None
+
     ltp = _f("last_price")
     oi = _f("oi")
     volume = _f("volume")
@@ -389,6 +480,15 @@ def fetch_futures_snapshot(client: DhanClient, store) -> FuturesSnapshot:
     # matching above; Dhan's quote schema has used both stylings.
     buy_quantity = _f("buy_quantity") or _f("total_buy_quantity")
     sell_quantity = _f("sell_quantity") or _f("total_sell_quantity")
+    # OHLC: tried both as a nested "ohlc" object (common in Indian
+    # broker quote APIs) and as flat top-level keys, since Dhan's exact
+    # shape wasn't verifiable without a live response.
+    open_price = _nested_f("ohlc", "open") or _f("open_price") or _f("open")
+    high_price = _nested_f("ohlc", "high") or _f("high_price") or _f("high")
+    low_price = _nested_f("ohlc", "low") or _f("low_price") or _f("low")
+    close_price = _nested_f("ohlc", "close") or _f("close_price") or _f("close")
+    average_price = _f("average_price") or _f("avg_price")
+    last_trade_time = quote.get("last_trade_time") or quote.get("LTT")
     timestamp = now_ist().isoformat()
 
     prev = store.get_previous_futures_snapshot(timestamp)
@@ -416,4 +516,6 @@ def fetch_futures_snapshot(client: DhanClient, store) -> FuturesSnapshot:
         error=None if ltp is not None else "Quote payload did not include a usable last_price.",
         buy_quantity=buy_quantity, sell_quantity=sell_quantity,
         flow_proxy=flow_proxy, flow_proxy_change=flow_proxy_change, flow_proxy_available=flow_proxy_available,
+        open_price=open_price, high_price=high_price, low_price=low_price, close_price=close_price,
+        average_price=average_price, last_trade_time=last_trade_time,
     )

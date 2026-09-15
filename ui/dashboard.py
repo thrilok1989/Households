@@ -157,6 +157,16 @@ def render_live_market_confirmation(
         oi_delta = f"{futures_snapshot.oi_change:+,.0f}" if futures_snapshot.oi_change is not None else None
         c2.metric("Futures OI", oi_display, delta=oi_delta)
         c3.metric("Positioning", futures_positioning)
+
+        if any(v is not None for v in (
+            futures_snapshot.open_price, futures_snapshot.high_price,
+            futures_snapshot.low_price, futures_snapshot.close_price,
+        )):
+            o1, o2, o3, o4 = st.columns(4)
+            o1.metric("Open", f"₹{futures_snapshot.open_price:,.2f}" if futures_snapshot.open_price is not None else "N/A")
+            o2.metric("High", f"₹{futures_snapshot.high_price:,.2f}" if futures_snapshot.high_price is not None else "N/A")
+            o3.metric("Low", f"₹{futures_snapshot.low_price:,.2f}" if futures_snapshot.low_price is not None else "N/A")
+            o4.metric("Prev Close", f"₹{futures_snapshot.close_price:,.2f}" if futures_snapshot.close_price is not None else "N/A")
     else:
         err = futures_snapshot.error if futures_snapshot else "not fetched"
         c1.metric("Futures LTP", "UNAVAILABLE")

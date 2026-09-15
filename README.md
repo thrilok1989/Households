@@ -4,6 +4,62 @@ Estimates **modeled** NIFTY dealer exposure and hedging pressure from
 live Dhan option-chain data, and checks whether actual market behaviour
 is confirming that read.
 
+# NIFTY Dealer Intelligence V2.1.3 — the actual live bug, found and fixed
+
+## What the diagnostics found
+
+The V2.1.2 diagnostics did their job: a real Dhan session reported
+
+> `6 candidate row(s) matched symbol+instrument+exchange, but none had a
+> parseable, non-expired expiry in column 'SEM_EXPIRY_DATE'.`
+
+That's precise — symbol/instrument/exchange matching was correct (6
+real NIFTY FUTIDX rows found), and the *only* problem was the expiry
+date format. The original parser only tried `%Y-%m-%d`, `%d-%b-%Y`,
+`%d/%m/%Y` — Dhan's live instrument master evidently uses a format with
+a time component (e.g. `2026-09-30 00:00:00`) that none of those
+matched.
+
+## The fix
+
+- `futures_data._parse_expiry_date()`: a dedicated parser tried against
+  12 explicit formats (covering `%Y-%m-%d %H:%M:%S`, `T`-separated
+  ISO-with-microseconds, `%d-%b-%Y %H:%M:%S`, etc.), plus a fallback
+  that takes the leading 10 characters as `%Y-%m-%d` when they look like
+  a plain ISO date — this catches essentially any `YYYY-MM-DD<anything>`
+  variant without needing to enumerate every possible time-component
+  format explicitly.
+- **`InstrumentMasterDiagnostics` now distinguishes "couldn't parse the
+  expiry at all" from "parsed fine but is in the past"** — the earlier
+  version conflated these into one message, which would have been
+  actively misleading here (it would have said "raw values: (column was
+  empty)" even though the column had real, valid-looking data). Now:
+  `parsed_but_expired` is tracked separately, and **`sample_expiry_values`**
+  captures up to 3 actual raw strings that failed to parse — the exact
+  evidence that led to this fix, and what future format mismatches will
+  now surface immediately without another round-trip.
+- **OHLC + a few more quote fields added** (`open_price`, `high_price`,
+  `low_price`, `close_price`, `average_price`, `last_trade_time`),
+  parsed defensively from both nested (`ohlc: {open, high, low, close}`)
+  and flat key shapes, since Dhan's exact quote schema for this field
+  set wasn't independently verified. Any field Dhan doesn't actually
+  return stays `None` — nothing here is fabricated. Shown in both the
+  Futures card and the Live Diagnostic Panel.
+
+**Tests: 138 → 147, all passing.** Nine new tests, including one that
+reproduces the exact live failure verbatim (6 candidate rows,
+`YYYY-MM-DD HH:MM:SS`-format expiry) and confirms it now resolves
+correctly, plus coverage for the corrected diagnostic-note branching and
+the new OHLC fields defaulting to `None` (never 0) when absent.
+
+**Honest note:** I still don't have a live Dhan connection to confirm
+the OHLC field names against a real response — same caveat as the
+buy/sell-quantity proxy fields. If `open_price`/`high_price`/etc. show
+`N/A` in the next live run, that's the next diagnostic to extend the
+same way this expiry fix was: capture what's actually there and adjust.
+
+---
+
 # NIFTY Dealer Intelligence V2.1.2 — futures resolution diagnostics
 
 ## Live test result and the fix

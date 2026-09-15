@@ -326,6 +326,9 @@ def main() -> None:
             "Symbol": futures_snapshot.symbol, "Expiry": futures_snapshot.expiry,
             "LTP": futures_snapshot.ltp, "Price change": futures_snapshot.price_change,
             "OI": futures_snapshot.oi, "ΔOI": futures_snapshot.oi_change,
+            "Open": futures_snapshot.open_price, "High": futures_snapshot.high_price,
+            "Low": futures_snapshot.low_price, "Prev Close": futures_snapshot.close_price,
+            "Avg Price": futures_snapshot.average_price, "Last Trade Time": futures_snapshot.last_trade_time,
             "Positioning": futures_positioning,
             "Error": futures_snapshot.error,
         },
@@ -342,6 +345,8 @@ def main() -> None:
             "Rows with 'NIFTY' in symbol": futures_snapshot.diagnostics.nifty_symbol_rows,
             "...passing instrument/exchange filter": futures_snapshot.diagnostics.futidx_candidate_rows,
             "...with a valid unexpired expiry": futures_snapshot.diagnostics.unexpired_candidates,
+            "...parsed fine but already expired": futures_snapshot.diagnostics.parsed_but_expired,
+            "Raw expiry values that failed to parse": futures_snapshot.diagnostics.sample_expiry_values,
             "Diagnosis": futures_snapshot.diagnostics.note,
         }} if futures_snapshot.diagnostics else {}),
         "Flow / CVD": {

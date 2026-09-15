@@ -1324,7 +1324,8 @@ def test_diagnostics_report_expired_only_contracts():
     assert diag.nifty_symbol_rows == 1
     assert diag.futidx_candidate_rows == 1
     assert diag.unexpired_candidates == 0
-    assert "non-expired expiry" in diag.note
+    assert diag.parsed_but_expired == 1
+    assert "were in the past" in diag.note
 
 
 def test_diagnostics_success_case_has_positive_note():
@@ -1369,3 +1370,97 @@ def test_futures_snapshot_carries_diagnostics_on_resolution_failure():
     assert snap.diagnostics is not None
     assert "Could not match" in snap.diagnostics.note
     assert "Could not resolve" in snap.error
+
+
+# =======================================================================
+# V2.1.2 — robust expiry date parsing (the actual live-observed bug)
+# =======================================================================
+
+from futures_data import _parse_expiry_date
+
+
+def test_parse_expiry_date_plain_iso():
+    assert _parse_expiry_date("2026-09-30") is not None
+
+
+def test_parse_expiry_date_iso_with_time_component():
+    """This is the exact shape the live Dhan instrument master was
+    observed to use — a plain 'YYYY-MM-DD' format list alone missed it."""
+    dt = _parse_expiry_date("2026-09-30 00:00:00")
+    assert dt is not None
+    assert dt.year == 2026 and dt.month == 9 and dt.day == 30
+
+
+def test_parse_expiry_date_iso_t_separator_with_micros():
+    dt = _parse_expiry_date("2026-09-30T00:00:00.0")
+    assert dt is not None
+    assert dt.day == 30
+
+
+def test_parse_expiry_date_dd_mon_yyyy():
+    dt = _parse_expiry_date("30-Sep-2026")
+    assert dt is not None and dt.month == 9
+
+
+def test_parse_expiry_date_garbage_returns_none_not_a_guess():
+    assert _parse_expiry_date("not-a-date") is None
+    assert _parse_expiry_date("") is None
+
+
+def test_instrument_master_resolves_with_time_component_expiry():
+    """End-to-end regression test for the exact live failure: 6 rows
+    matching symbol+instrument+exchange, expiry column present with a
+    time component the old parser rejected."""
+    csv_text = (
+        "SEM_TRADING_SYMBOL,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,SEM_EXM_EXCH_ID,SEM_EXPIRY_DATE\n"
+        "NIFTY-FUT-SEP,111,FUTIDX,NSE,2030-09-30 00:00:00\n"
+        "NIFTY-FUT-OCT,222,FUTIDX,NSE,2030-10-30 00:00:00\n"
+    )
+    from futures_data import _parse_instrument_master
+    resolved, diag = _parse_instrument_master(csv_text)
+    assert resolved is not None
+    assert resolved.security_id == 111  # nearest expiry chosen
+    assert diag.unexpired_candidates == 2
+
+
+def test_diagnostics_capture_raw_unparseable_expiry_values():
+    csv_text = (
+        "SEM_TRADING_SYMBOL,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,SEM_EXM_EXCH_ID,SEM_EXPIRY_DATE\n"
+        "NIFTY-FUT,12345,FUTIDX,NSE,totally-unparseable-value\n"
+    )
+    from futures_data import _parse_instrument_master
+    resolved, diag = _parse_instrument_master(csv_text)
+    assert resolved is None
+    assert "totally-unparseable-value" in diag.sample_expiry_values
+    assert "Raw values actually seen" in diag.note
+
+
+# ---------------------------------------------------------------------
+# OHLC + extra quote fields (parsed defensively, never fabricated)
+# ---------------------------------------------------------------------
+
+def test_futures_snapshot_ohlc_fields_default_to_none():
+    """A snapshot built without OHLC data must show None, not 0 or a
+    fabricated value."""
+    snap = FuturesSnapshot(
+        symbol="NIFTY-FUT", expiry="2026-09-30", ltp=23450.0, previous_ltp=None,
+        price_change=None, price_change_pct=None, oi=None, previous_oi=None,
+        oi_change=None, oi_change_pct=None, volume=None, timestamp="x", available=True,
+    )
+    assert snap.open_price is None
+    assert snap.high_price is None
+    assert snap.low_price is None
+    assert snap.close_price is None
+
+
+def test_futures_snapshot_accepts_ohlc_when_provided():
+    snap = FuturesSnapshot(
+        symbol="NIFTY-FUT", expiry="2026-09-30", ltp=23450.0, previous_ltp=None,
+        price_change=None, price_change_pct=None, oi=None, previous_oi=None,
+        oi_change=None, oi_change_pct=None, volume=None, timestamp="x", available=True,
+        open_price=23400.0, high_price=23470.0, low_price=23390.0, close_price=23410.0,
+        average_price=23430.5, last_trade_time="09:20:00",
+    )
+    assert snap.open_price == 23400.0
+    assert snap.high_price == 23470.0
+    assert snap.average_price == 23430.5
